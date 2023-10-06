@@ -14,7 +14,6 @@
 #![feature(let_chains)]
 #![feature(impl_trait_in_assoc_type)]
 #![feature(decl_macro)]
-#![feature(generic_const_exprs)]
 #![feature(stmt_expr_attributes)]
 #![feature(proc_macro_hygiene)]
 #![allow(unused)]

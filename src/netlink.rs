@@ -508,23 +508,19 @@ impl NLStateful {
 }
 
 impl Netns {
-    /// enter a ns
-    pub async fn enter(entry: NSID) -> Result<Netns> {
-        let f = entry.open().await?;
-        f.enter()?;
-        let netlink = NLWrapper::new(Arc::new(NLHandle::new_in_current_ns()));
-        let netlink = NLStateful::new(netlink).await?;
-        Ok(Netns { id: entry, netlink })
-    }
-    pub async fn thread() -> Result<Netns> {
-        let id = NSIDFrom::Thread.to_id(NSCreate::empty()).await?;
-        let mut netlink =
-            NLStateful::new(NLWrapper::new(Arc::new(NLHandle::new_in_current_ns()))).await?;
-        netlink.fill().await?;
-        Ok(Netns { id, netlink })
-    }
     pub fn new(ns: NSID, netlink: NLStateful) -> Self {
         Self { id: ns, netlink }
+    }
+    pub async fn thread() -> Result<Netns> {
+        let id = NSIDFrom::Thread.create(NSCreate::empty()).await?;
+        Self::new_as(id).await
+    }
+    /// Initialize it on current thread. Assume its NSID.
+    pub async fn new_as(ns: NSID) -> Result<Netns> {
+        let netlink = NLWrapper::new(Arc::new(NLHandle::new_in_current_ns()));
+        let mut netlink = NLStateful::new(netlink).await?;
+        netlink.fill().await?;
+        Ok(Netns { id: ns, netlink })
     }
     // 'x is shorter than 'a
     pub async fn refresh<'x>(&'x mut self) -> Result<()> {

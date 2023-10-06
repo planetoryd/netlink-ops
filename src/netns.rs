@@ -74,6 +74,12 @@ pub enum NSIDFrom {
 #[serde(transparent)]
 pub struct Pid(pub u32);
 
+impl Pid {
+    pub fn to_nix(self) -> Result<nix::unistd::Pid> {
+        Ok(nix::unistd::Pid::from_raw(self.0.try_into()?))
+    }
+}
+
 impl NSIDFrom {
     pub async fn ino(path: &Path) -> Result<u64> {
         let file = tokio::fs::File::open(path).await?;
@@ -85,7 +91,7 @@ impl NSIDFrom {
         let stat = nix::sys::stat::fstat(file.as_raw_fd())?;
         Ok(stat.st_ino)
     }
-    pub async fn to_id(self, create: NSCreate) -> Result<NSID> {
+    pub async fn create(self, create: NSCreate) -> Result<NSID> {
         let path = self.path();
         if !path.exists() {
             if (create.intersects(NSCreate::Named) && matches!(self, NSIDFrom::Named(_)))
@@ -101,7 +107,7 @@ impl NSIDFrom {
             path: Some(Arc::new(path.to_owned())),
         })
     }
-    pub fn to_id_sync(self, create: NSCreate) -> Result<NSID> {
+    pub fn create_sync(self, create: NSCreate) -> Result<NSID> {
         let path = self.path();
         if !path.exists() {
             if (create.intersects(NSCreate::Named) && matches!(self, NSIDFrom::Named(_)))
@@ -171,8 +177,8 @@ impl NSID {
 pub struct NsFile<F: AsRawFd>(pub F);
 
 impl<F: AsRawFd> NsFile<F> {
-    pub fn enter(&self) -> Result<()> {
-        nix::sched::setns(self.0.as_raw_fd(), CloneFlags::CLONE_NEWNET)?;
+    pub fn enter(&self, f: CloneFlags) -> Result<()> {
+        nix::sched::setns(self.0.as_raw_fd(), f)?;
         Ok(())
     }
     pub fn set_cloexec(&self) -> Result<i32> {

@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use crate::netlink::NLWrapper;
 use crate::*;
 
-// Abstract stuff
+// Runtime checking of correct execution
 
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Derivative)]
 #[derivative(Debug)]
