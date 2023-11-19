@@ -22,5 +22,4 @@
 pub mod netlink;
 pub mod nft;
 pub mod state;
-pub mod netns;
 pub mod errors;

@@ -8,10 +8,9 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1.27.0", features = ["full"] }
 ipnetwork = { version = "0.20.0", features = ["serde"] }
-nix = { version = "0.26.2", features = ["user", "sched"] }
+nix = { version = "0.26.2", features = ["user", "sched", "fs"] }
 anyhow = { version = "1.0.71", features = ["backtrace"] }
 rtnetlink = { path = "../rtnetlink" }
-tidy-tuntap = { path = "../tidy-tuntap" }
 rustables = { path = "../rustables" }
 derivative = "2.2.0"
 futures = "0.3.28"

@@ -1,7 +1,4 @@
-use crate::{
-    netns::{NSCreate, NSIDFrom, Netns, NSID},
-    nft::{redirect_dns, Mergeable, NftState},
-};
+use crate::nft::{redirect_dns, Mergeable, NftState};
 use derivative::Derivative;
 
 use fixed_map::{Key, Map};
@@ -66,21 +63,47 @@ use rtnetlink::{Handle, NetworkNamespace};
 /// Stateless connection
 pub struct NLHandle {
     /// this handle may be proxied
-    pub handle: Handle,
+    pub rawh: Handle,
+    pub id: NS,
 }
 
-#[derive(Derivative)]
+#[derive(Debug, Derivative)]
+#[derivative(PartialEq)]
+pub struct NS {
+    inode: u64,
+    dev: u64,
+    #[derivative(PartialEq = "ignore")]
+    /// anything that to get an FD
+    source: PathBuf,
+}
+
+const SELF_NET: &str = "/proc/self/ns/net";
+
+impl NS {
+    pub async fn open(&self) -> Result<File> {
+        Ok(File::open(&self.source).await?)
+    }
+    pub fn from_path(source: PathBuf) -> Result<Self> {
+        let fst = nix::sys::stat::stat(&source)?;
+        Ok(NS {
+            inode: fst.st_ino,
+            dev: fst.st_dev,
+            source,
+        })
+    }
+}
+
+#[derive(Derivative, Default)]
 #[derivative(PartialEq, Eq, Debug)]
 /// Netlink manipulator with locally duplicated state
 pub struct NLStateful {
     #[derivative(PartialEq = "ignore")]
     #[derivative(Debug = "ignore")]
-    conn: NLWrapper,
-    pub veths: BTreeMap<VPairKey, VethPair>,
+    pub conn: NLWrapped,
+    veths: BTreeMap<VPairKey, VethPair>,
     /// msg.header.index
-    pub links_index: BTreeMap<u32, LinkKey>,
-    /// Do not use this directly.
-    links: BTreeMap<LinkKey, Existence<LinkAttrs>>,
+    links_index: BTreeMap<u32, LinkKey>,
+    links: BTreeMap<LinkKey, Existence<LinkDev>>,
     link_kind: HashMap<u32, nlas::InfoKind>,
     routes: HashMap<RouteFor, Existence<()>>,
 }
@@ -91,58 +114,47 @@ pub enum RouteFor {
     TUNIpv6,
 }
 
-#[derive(Clone)]
-pub struct NLWrapper {
-    handle: Arc<NLHandle>,
+#[derive(Clone, Default)]
+pub struct NLWrapped {
+    handle: Option<Arc<NLHandle>>,
 }
 
-impl NLWrapper {
+impl NLWrapped {
     #[inline]
     pub fn h(&self) -> &NLHandle {
-        &self.handle
+        self.handle.as_ref().unwrap()
     }
-    pub async fn to_netns(self, id: NSID) -> Result<Netns> {
-        let mut nl: NLStateful = NLStateful::new(self).await?;
-        nl.fill().await?;
-        let ns = Netns::new(id, nl);
-        Ok(ns)
-    }
-    pub async fn set_up(&self, link: &mut LinkAttrs) -> Result<()> {
+    pub async fn set_up(&self, link: &mut LinkDev) -> Result<()> {
         if link.up.get() == Some(&true) {
             Ok(())
         } else {
-            self.handle.set_link_up(link.index).await?;
+            self.h().set_link_up(link.index).await?;
             link.up.trans_to(Exp::Expect(true))?;
             Ok(())
         }
     }
-    pub async fn add_addr(&mut self, link: &mut LinkAttrs, ip: IpNetwork) -> Result<()> {
+    pub async fn add_addr(&mut self, link: &mut LinkDev, ip: IpNetwork) -> Result<()> {
         if let Result::Ok(k) = link.addrs.filled()?.not_absent(&ip)
-            && (matches!(k, Existence::Exist(_)) || matches!(k, Existence::ShouldExist)) {
+            && (matches!(k, Existence::Exist(_)) || matches!(k, Existence::ShouldExist))
+        {
             // we don't error here.
         } else {
-            link.addrs.filled()?.trans_to(&ip, LExistence::ShouldExist).await?;
-            self.handle.add_addr_dev(ip, link.index).await?;
+            link.addrs
+                .filled()?
+                .trans_to(&ip, LExistence::ShouldExist)
+                .await?;
+            self.h().add_addr_dev(ip, link.index).await?;
         }
         Ok(())
     }
-    pub async fn remove_addr(&mut self, link: &mut LinkAttrs, addr: IpNetwork) -> Result<()> {
+    pub async fn remove_addr(&mut self, link: &mut LinkDev, addr: IpNetwork) -> Result<()> {
         let msg = link.addrs.filled()?.not_absent(&addr)?;
         let swap = msg.trans_to(LExistence::ExpectAbsent).await?;
 
-        self.handle
-            .handle
-            .address()
-            .del(swap.exist()?)
-            .execute()
-            .await?;
+        self.h().rawh.address().del(swap.exist()?).execute().await?;
         Ok(())
     }
-    pub async fn remove_addrs(
-        &mut self,
-        link: &mut LinkAttrs,
-        addrs: Vec<IpNetwork>,
-    ) -> Result<()> {
+    pub async fn remove_addrs(&mut self, link: &mut LinkDev, addrs: Vec<IpNetwork>) -> Result<()> {
         for addr in addrs {
             self.remove_addr(link, addr).await?;
         }
@@ -150,7 +162,7 @@ impl NLWrapper {
     }
     pub async fn ensure_addrs_46(
         &mut self,
-        link: &mut LinkAttrs,
+        link: &mut LinkDev,
         v4: IpNetwork,
         v6: IpNetwork,
     ) -> Result<()> {
@@ -243,14 +255,14 @@ impl Trans for LinkKey {
 }
 
 fn new_link_ctx<'m>(
-    links: &'m mut BTreeMap<LinkKey, Existence<LinkAttrs>>,
+    links: &'m mut BTreeMap<LinkKey, Existence<LinkDev>>,
     link_kind: &'m HashMap<u32, InfoKind>,
     veths: &'m mut BTreeMap<VPairKey, VethPair>,
 ) -> NLCtx<
     'm,
     LinkKey,
-    BTreeMap<LinkKey, Existence<LinkAttrs>>,
-    impl FnMut(&LinkKey, Option<&mut Existence<LinkAttrs>>) + 'm,
+    BTreeMap<LinkKey, Existence<LinkDev>>,
+    impl FnMut(&LinkKey, Option<&mut Existence<LinkDev>>) + 'm,
 > {
     NLCtx {
         map: links,
@@ -289,10 +301,10 @@ impl NLStateful {
         NLCtx<
             'm,
             LinkKey,
-            BTreeMap<LinkKey, Existence<LinkAttrs>>,
-            impl FnMut(&LinkKey, Option<&mut Existence<LinkAttrs>>) + 'm,
+            BTreeMap<LinkKey, Existence<LinkDev>>,
+            impl FnMut(&LinkKey, Option<&mut Existence<LinkDev>>) + 'm,
         >,
-        &mut NLWrapper,
+        &mut NLWrapped,
     ) {
         (
             new_link_ctx(&mut self.links, &self.link_kind, &mut self.veths),
@@ -302,22 +314,15 @@ impl NLStateful {
 }
 
 impl NLStateful {
-    /// retrieves the list of links and info for ns
-    pub async fn new(netlink: NLWrapper) -> Result<NLStateful> {
-        let nsnl = NLStateful {
-            links: BTreeMap::new(),
-            veths: BTreeMap::new(),
-            links_index: BTreeMap::new(),
-            conn: netlink,
-            link_kind: HashMap::new(),
-            routes: Default::default(),
-        };
-
-        Ok(nsnl)
+    pub fn new(nl: &NLWrapped) -> Self {
+        Self {
+            conn: nl.clone(),
+            ..Default::default()
+        }
     }
     pub async fn fill(&mut self) -> Result<()> {
         let netlink = self.conn.h();
-        let mut links = netlink.handle.link().get().execute();
+        let mut links = netlink.rawh.link().get().execute();
         while let Some(link) = links.try_next().await? {
             use rtnetlink::netlink_packet_route::rtnl::link::nlas::Nla;
 
@@ -345,7 +350,7 @@ impl NLStateful {
                 }
             }
             let name = name.ok_or(DevianceError)?;
-            let mut li = LinkAttrs {
+            let mut li = LinkDev {
                 up: Exp::Confirmed(up),
                 index,
                 addrs: Default::default(),
@@ -365,7 +370,7 @@ impl NLStateful {
             assert!(k.is_none());
         }
         // the filter is not done by kernel. hence just do it here.
-        let addrs = netlink.handle.address().get().execute();
+        let addrs = netlink.rawh.address().get().execute();
         let addrs: Vec<AddressMessage> = addrs.try_collect().await?;
         for addr in addrs.into_iter() {
             let index_of_the_link_too = addr.header.index.clone(); // as observed.
@@ -408,7 +413,7 @@ impl NLStateful {
     }
 
     // Some methods change state of self, which are therefore placed here
-    pub async fn remove_link<'at>(&'at mut self, k: &'at LinkKey) -> Result<LinkAttrs> {
+    pub async fn remove_link<'at>(&'at mut self, k: &'at LinkKey) -> Result<LinkDev> {
         // we want to reflect the state of links as that vector
         log::trace!("remove link {:?}", k);
         nl_ctx!(link, conn, self);
@@ -420,8 +425,7 @@ impl NLStateful {
         Ok(link_removed)
     }
     /// move link from this ns to dst
-    pub async fn move_link_to_ns(&mut self, k: &LinkKey, dst: &mut Netns, fd: RawFd) -> Result<()> {
-        log::trace!("move link {:?} to {:?}", k, dst.id);
+    pub async fn move_link_to_ns(&mut self, k: &LinkKey, dst: &mut Self, fd: RawFd) -> Result<()> {
         self.get_link(k.to_owned()).await?;
         nl_ctx!(link, conn, self);
 
@@ -430,7 +434,7 @@ impl NLStateful {
             .exist()?;
         conn.h().ip_setns_by_fd(fd, v.index).await?;
 
-        nl_ctx!(link, _conn, dst.netlink);
+        nl_ctx!(link, _conn, dst);
         link.trans_to(k, LExistence::ShouldExist).await?;
         Ok(())
     }
@@ -443,7 +447,7 @@ impl NLStateful {
                 &name,
                 LExistence::Exist(LazyVal::Todo(Box::pin(async {
                     let k = conn.h().get_link(name.clone()).await?;
-                    let mut la: LinkAttrs = k.into();
+                    let mut la: LinkDev = k.into();
                     let addrs = conn.h().get_link_addrs(la.index).await?;
                     la.fill_addrs(addrs)?;
                     Ok(la)
@@ -505,37 +509,14 @@ impl NLStateful {
             .await?;
         self.conn.h().ip_add_route(index, dst, v4).await
     }
+    pub fn id(&self) -> &NS {
+        &self.conn.h().id
+    }
 }
 
-impl Netns {
-    pub fn new(ns: NSID, netlink: NLStateful) -> Self {
-        Self { id: ns, netlink }
-    }
-    pub async fn thread() -> Result<Netns> {
-        let id = NSIDFrom::Thread.create(NSCreate::empty()).await?;
-        Self::new_as(id).await
-    }
-    /// Initialize it on current thread. Assume its NSID.
-    pub async fn new_as(ns: NSID) -> Result<Netns> {
-        let netlink = NLWrapper::new(Arc::new(NLHandle::new_in_current_ns()));
-        let mut netlink = NLStateful::new(netlink).await?;
-        netlink.fill().await?;
-        Ok(Netns { id: ns, netlink })
-    }
-    // 'x is shorter than 'a
-    pub async fn refresh<'x>(&'x mut self) -> Result<()> {
-        // will just rebuild that struct based on the handle
-        log::trace!("refresh local netlink expectation for {:?}", self.id);
-        let c: NLWrapper = self.netlink.conn.clone();
-        let mut new_nl: NLStateful = NLStateful::new(c).await?;
-        new_nl.fill().await?;
-        self.netlink = new_nl;
-        Ok(())
-    }
-}
 #[derive(Derivative)]
 #[derivative(Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub struct LinkAttrs {
+pub struct LinkDev {
     pub up: Exp<bool>,
     pub index: u32,
     #[derivative(Hash = "ignore")]
@@ -547,7 +528,7 @@ pub struct LinkAttrs {
     pub pair: Option<VPairKey>,
 }
 
-impl LinkAttrs {
+impl LinkDev {
     pub fn fill_addrs(&mut self, msgs: Vec<AddressMessage>) -> Result<()> {
         let exp = self.addrs.to_filled()?;
         for addr in msgs.into_iter() {
@@ -587,7 +568,7 @@ impl Trans for AddressMessage {
     }
 }
 
-impl Trans for LinkAttrs {
+impl Trans for LinkDev {
     /// What is allowed to change when perceiving changes
     fn trans(&self, to: &Self) -> bool {
         self.up.trans(&to.up)
@@ -599,17 +580,18 @@ impl DepedentEMapE<VPairKey, LinkAB, LinkKey, VethPair> for BTreeMap<VPairKey, V
 
 type VethPair = Map<LinkAB, Existence<LinkKey>>;
 
-impl NLWrapper {
-    #[inline]
-    pub fn new(value: Arc<NLHandle>) -> Self {
-        Self { handle: value }
+impl NLWrapped {
+    pub fn new(value: impl Into<Arc<NLHandle>>) -> Self {
+        Self {
+            handle: Some(value.into()),
+        }
     }
 }
 
-impl From<LinkMessage> for LinkAttrs {
+impl From<LinkMessage> for LinkDev {
     fn from(msg: LinkMessage) -> Self {
         let up = msg.header.flags & IFF_UP != 0;
-        LinkAttrs {
+        LinkDev {
             up: Exp::Confirmed(up),
             addrs: Default::default(),
             index: msg.header.index.into(),
@@ -619,15 +601,17 @@ impl From<LinkMessage> for LinkAttrs {
 }
 
 impl NLHandle {
-    pub fn new_in_current_ns() -> Self {
+    pub fn new_self_proc_tokio() -> Result<Self> {
         use rtnetlink::new_connection;
         let (connection, handle, _) = new_connection().unwrap();
         tokio::spawn(connection);
-
-        Self { handle }
+        Ok(Self {
+            rawh: handle,
+            id: NS::from_path(SELF_NET.into())?,
+        })
     }
     pub async fn rm_link(&self, index: u32) -> Result<()> {
-        self.handle
+        self.rawh
             .link()
             .del(index)
             .execute()
@@ -635,7 +619,7 @@ impl NLHandle {
             .map_err(anyhow::Error::from)
     }
     pub async fn get_link(&self, name: LinkKey) -> Result<LinkMessage> {
-        let mut links = self.handle.link().get().match_name(name.into()).execute();
+        let mut links = self.rawh.link().get().match_name(name.into()).execute();
         if let Some(link) = links.try_next().await? {
             Ok(link)
         } else {
@@ -644,7 +628,7 @@ impl NLHandle {
     }
     pub async fn get_link_addrs(&self, index: u32) -> Result<Vec<AddressMessage>> {
         let addrs = self
-            .handle
+            .rawh
             .address()
             .get()
             .set_link_index_filter(index)
@@ -653,7 +637,7 @@ impl NLHandle {
         Ok(addrs)
     }
     pub async fn set_link_up(&self, index: u32) -> Result<()> {
-        self.handle
+        self.rawh
             .link()
             .set(index)
             .up()
@@ -662,7 +646,7 @@ impl NLHandle {
             .map_err(anyhow::Error::from)
     }
     pub async fn add_veth_pair(&self, base_name: &VPairKey) -> Result<()> {
-        self.handle
+        self.rawh
             .link()
             .add()
             .veth(
@@ -675,7 +659,7 @@ impl NLHandle {
     }
     pub async fn add_addr_dev(&self, addr: IpNetwork, dev: u32) -> Result<()> {
         // assuming the desired IP has not been added
-        self.handle
+        self.rawh
             .address()
             .add(dev, addr.ip(), addr.prefix())
             .execute()
@@ -683,7 +667,7 @@ impl NLHandle {
             .map_err(anyhow::Error::from)
     }
     pub async fn del_addr(&self, addr: AddressMessage) -> Result<()> {
-        self.handle
+        self.rawh
             .address()
             .del(addr)
             .execute()
@@ -691,7 +675,7 @@ impl NLHandle {
             .map_err(anyhow::Error::from)
     }
     pub async fn ip_setns_by_fd(&self, fd: RawFd, dev: u32) -> Result<()> {
-        self.handle
+        self.rawh
             .link()
             .set(dev)
             .setns_by_fd(fd)
@@ -707,7 +691,7 @@ impl NLHandle {
         dst: Option<IpNetwork>,
         v4: Option<bool>,
     ) -> Result<()> {
-        let req = self.handle.route().add().output_interface(index);
+        let req = self.rawh.route().add().output_interface(index);
         match dst {
             Some(IpNetwork::V4(ip)) => req
                 .v4()
@@ -750,29 +734,26 @@ pub struct VethConn {
 
 impl VethConn {
     /// Adaptive application of Veth connection, accepting dirty state
-    pub async fn apply<'n>(&self, subject_ns: &'n mut Netns, t_ns: &'n mut Netns) -> Result<()> {
-        let t_fd = t_ns.id.open().await?;
-        log::info!(
-            "Apply VethConn S{} -> T{}. {:?}",
-            subject_ns.id,
-            t_ns.id,
-            self.key
-        );
-        if subject_ns.id == t_ns.id {
+    pub async fn apply<'n>(
+        &self,
+        subject_ns: &'n mut NLStateful,
+        t_ns: &'n mut NLStateful,
+    ) -> Result<()> {
+        let t_ns_f = t_ns.id().open().await?;
+        if subject_ns.id() == t_ns.id() {
             bail!("Invalid VethConn, subject and target NS can not be the same");
         }
         let mut redo = false;
         let (mut a, mut b) = (false, false);
         let mut a_in_t = false;
-        if let Some(v) = subject_ns.netlink.veths.g(&self.key) {
+        if let Some(v) = subject_ns.veths.g(&self.key) {
             if v.lenient(&LinkAB::A) {
                 a = true;
                 if v.lenient(&LinkAB::B) {
                     subject_ns
-                        .netlink
-                        .move_link_to_ns(&self.key.link(LinkAB::B), t_ns, t_fd.0.as_raw_fd())
+                        .move_link_to_ns(&self.key.link(LinkAB::B), t_ns, t_ns_f.as_raw_fd())
                         .await?;
-                    t_ns.netlink.get_link(self.key.link(LinkAB::B)).await?;
+                    t_ns.get_link(self.key.link(LinkAB::B)).await?;
                 }
             } else {
                 redo = true;
@@ -780,7 +761,7 @@ impl VethConn {
         } else {
             redo = true;
         }
-        if let Some(v) = t_ns.netlink.veths.g(&self.key) {
+        if let Some(v) = t_ns.veths.g(&self.key) {
             if v.lenient(&LinkAB::B) {
                 b = true;
                 if v.lenient(&LinkAB::A) {
@@ -795,39 +776,32 @@ impl VethConn {
         }
         if redo {
             if a {
-                subject_ns
-                    .netlink
-                    .remove_link(&self.key.link(LinkAB::A))
-                    .await?;
+                subject_ns.remove_link(&self.key.link(LinkAB::A)).await?;
             }
             if a_in_t {
-                t_ns.netlink.remove_link(&self.key.link(LinkAB::A)).await?;
+                t_ns.remove_link(&self.key.link(LinkAB::A)).await?;
             }
             if b {
-                t_ns.netlink.remove_link(&self.key.link(LinkAB::B)).await?;
+                t_ns.remove_link(&self.key.link(LinkAB::B)).await?;
             }
-            subject_ns.netlink.new_veth_pair(self.key.clone()).await?;
+            subject_ns.new_veth_pair(self.key.clone()).await?;
             subject_ns
-                .netlink
-                .move_link_to_ns(&self.key.link(LinkAB::B), t_ns, t_fd.0.as_raw_fd())
+                .move_link_to_ns(&self.key.link(LinkAB::B), t_ns, t_ns_f.as_raw_fd())
                 .await?;
         }
         Ok(())
     }
     pub async fn apply_addr_up<'n>(
         &self,
-        subject_ns: &'n mut Netns,
-        t_ns: &'n mut Netns,
+        subject_ns: &'n mut NLStateful,
+        t_ns: &'n mut NLStateful,
     ) -> Result<()> {
-        subject_ns
-            .netlink
-            .get_link(self.key.link(LinkAB::A))
-            .await?;
-        nl_ctx!(link, conn, subject_ns.netlink);
+        subject_ns.get_link(self.key.link(LinkAB::A)).await?;
+        nl_ctx!(link, conn, subject_ns);
         let la = link.not_absent(&self.key.link(LinkAB::A))?.exist_mut()?;
         conn.set_up(la).await?;
         conn.ensure_addrs_46(la, self.ip_va, self.ip6_va).await?;
-        nl_ctx!(link, conn, t_ns.netlink);
+        nl_ctx!(link, conn, t_ns);
         let lk = self.key.link(LinkAB::B);
         let la = link.not_absent(&lk)?.exist_mut()?;
         conn.set_up(la).await?;

@@ -1,2 +1,6 @@
 
-High-level interface to netlink, netfilter, and utilities, written for `netns-proxy`.
+High-level interface to netlink, netfilter, and utilities, written for `nsproxy`.
+
+Todo
+
+- Fuzzy testing.

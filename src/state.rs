@@ -18,7 +18,7 @@ use std::{
 use fixed_map::{Key, Map};
 use std::collections::HashMap;
 
-use crate::netlink::NLWrapper;
+use crate::netlink::NLWrapped;
 use crate::*;
 
 // Runtime checking of correct execution
