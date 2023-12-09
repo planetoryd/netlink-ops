@@ -23,3 +23,5 @@ pub mod netlink;
 pub mod nft;
 pub mod state;
 pub mod errors;
+pub use rtnetlink;
+pub use rustables;

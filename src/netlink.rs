@@ -2,9 +2,12 @@ use crate::nft::{redirect_dns, Mergeable, NftState};
 use derivative::Derivative;
 
 use fixed_map::{Key, Map};
+use fully_pub::fully_pub;
 use futures::{future::Ready, Future, FutureExt, SinkExt, StreamExt, TryFutureExt};
 use ipnetwork::IpNetwork;
 
+use libc::pid_t;
+use nsproxy_common::{ExactNS, PidPath};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::AsyncWriteExt,
@@ -24,7 +27,7 @@ use std::{
     hash::Hash,
     net::Ipv6Addr,
     ops::{Deref, Index},
-    os::fd::FromRawFd,
+    os::fd::{AsFd, FromRawFd},
     pin::Pin,
     process::Stdio,
     str::FromStr,
@@ -50,6 +53,7 @@ use rtnetlink::{
 use crate::errors::*;
 use crate::state::*;
 use crate::*;
+use derive_new::new;
 
 /// Creates an RAII context
 pub macro nl_ctx( $sub:ident, $conn:ident, $nl:expr ) {
@@ -60,51 +64,49 @@ use futures::stream::TryStreamExt;
 use rtnetlink::netlink_packet_route::{rtnl::link::LinkMessage, AddressMessage, IFF_UP};
 use rtnetlink::{Handle, NetworkNamespace};
 
-/// Stateless connection
-pub struct NLHandle {
-    /// this handle may be proxied
-    pub rawh: Handle,
-    pub id: NS,
+#[derive(Clone, Debug, derive_new::new)]
+/// Handle with relevant information
+/// Eq iff NS equals
+pub struct NLHandle<S: Send + Sync> {
+    rawh: Handle,
+    id: ExactNS<S>,
 }
 
-#[derive(Debug, Derivative)]
-#[derivative(PartialEq)]
-pub struct NS {
-    inode: u64,
-    dev: u64,
-    #[derivative(PartialEq = "ignore")]
-    /// anything that to get an FD
-    source: PathBuf,
-}
+impl<S: Send + Sync> ::std::cmp::Eq for NLHandle<S> where S: ::std::cmp::Eq {}
 
-const SELF_NET: &str = "/proc/self/ns/net";
-
-impl NS {
-    pub async fn open(&self) -> Result<File> {
-        Ok(File::open(&self.source).await?)
-    }
-    pub fn from_path(source: PathBuf) -> Result<Self> {
-        let fst = nix::sys::stat::stat(&source)?;
-        Ok(NS {
-            inode: fst.st_ino,
-            dev: fst.st_dev,
-            source,
-        })
+impl<S: Send + Sync, B: Send + Sync> ::std::cmp::PartialEq<NLHandle<B>> for NLHandle<S> {
+    fn eq(&self, other: &NLHandle<B>) -> bool {
+        true && match *self {
+            NLHandle {
+                rawh: _,
+                id: ref __self_1,
+            } => match *other {
+                NLHandle {
+                    rawh: _,
+                    id: ref __other_1,
+                } => true && &(*__self_1) == &(*__other_1),
+            },
+        }
     }
 }
 
-#[derive(Derivative, Default)]
+#[derive(Derivative, new)]
 #[derivative(PartialEq, Eq, Debug)]
 /// Netlink manipulator with locally duplicated state
-pub struct NLStateful {
+pub struct NLDriver<S: Send + Sync> {
     #[derivative(PartialEq = "ignore")]
     #[derivative(Debug = "ignore")]
-    pub conn: NLWrapped,
+    pub conn: NLHandle<S>,
+    #[new(default)]
     veths: BTreeMap<VPairKey, VethPair>,
+    #[new(default)]
     /// msg.header.index
     links_index: BTreeMap<u32, LinkKey>,
+    #[new(default)]
     links: BTreeMap<LinkKey, Existence<LinkDev>>,
+    #[new(default)]
     link_kind: HashMap<u32, nlas::InfoKind>,
+    #[new(default)]
     routes: HashMap<RouteFor, Existence<()>>,
 }
 
@@ -114,26 +116,34 @@ pub enum RouteFor {
     TUNIpv6,
 }
 
-#[derive(Clone, Default)]
-pub struct NLWrapped {
-    handle: Option<Arc<NLHandle>>,
+pub trait GetPidOrFd {
+    fn open(&self) -> Result<PidOrFd>;
 }
 
-impl NLWrapped {
-    #[inline]
-    pub fn h(&self) -> &NLHandle {
-        self.handle.as_ref().unwrap()
+impl GetPidOrFd for NLHandle<pid_t> {
+    fn open(&self) -> Result<PidOrFd> {
+        Ok(PidOrFd::Pid(self.id.source.try_into()?))
     }
-    pub async fn set_up(&self, link: &mut LinkDev) -> Result<()> {
+}
+
+impl GetPidOrFd for NLHandle<PathBuf> {
+    fn open(&self) -> Result<PidOrFd> {
+        Ok(PidOrFd::Fd(Box::new(std::fs::File::open(&self.id.source)?)))
+    }
+}
+
+#[fully_pub]
+impl<S: Send + Sync> NLHandle<S> {
+    async fn set_up(&self, link: &mut LinkDev) -> Result<()> {
         if link.up.get() == Some(&true) {
             Ok(())
         } else {
-            self.h().set_link_up(link.index).await?;
+            self.set_link_up(link.index).await?;
             link.up.trans_to(Exp::Expect(true))?;
             Ok(())
         }
     }
-    pub async fn add_addr(&mut self, link: &mut LinkDev, ip: IpNetwork) -> Result<()> {
+    async fn add_addr(&mut self, link: &mut LinkDev, ip: IpNetwork) -> Result<()> {
         if let Result::Ok(k) = link.addrs.filled()?.not_absent(&ip)
             && (matches!(k, Existence::Exist(_)) || matches!(k, Existence::ShouldExist))
         {
@@ -143,24 +153,24 @@ impl NLWrapped {
                 .filled()?
                 .trans_to(&ip, LExistence::ShouldExist)
                 .await?;
-            self.h().add_addr_dev(ip, link.index).await?;
+            self.add_addr_dev(ip, link.index).await?;
         }
         Ok(())
     }
-    pub async fn remove_addr(&mut self, link: &mut LinkDev, addr: IpNetwork) -> Result<()> {
+    async fn remove_addr(&mut self, link: &mut LinkDev, addr: IpNetwork) -> Result<()> {
         let msg = link.addrs.filled()?.not_absent(&addr)?;
         let swap = msg.trans_to(LExistence::ExpectAbsent).await?;
 
-        self.h().rawh.address().del(swap.exist()?).execute().await?;
+        self.rawh.address().del(swap.exist()?).execute().await?;
         Ok(())
     }
-    pub async fn remove_addrs(&mut self, link: &mut LinkDev, addrs: Vec<IpNetwork>) -> Result<()> {
+    async fn remove_addrs(&mut self, link: &mut LinkDev, addrs: Vec<IpNetwork>) -> Result<()> {
         for addr in addrs {
             self.remove_addr(link, addr).await?;
         }
         Ok(())
     }
-    pub async fn ensure_addrs_46(
+    async fn ensure_addrs_46(
         &mut self,
         link: &mut LinkDev,
         v4: IpNetwork,
@@ -179,6 +189,7 @@ impl NLWrapped {
     }
 }
 
+/// Use .parse()
 #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, Debug, PartialOrd, Ord)]
 pub struct LinkKey(String);
 
@@ -198,6 +209,7 @@ impl From<LinkKey> for String {
     }
 }
 
+/// Use .parse()
 #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, Debug, PartialOrd, Ord)]
 pub struct VPairKey(String);
 
@@ -292,10 +304,11 @@ fn new_link_ctx<'m>(
     }
 }
 
-impl NLStateful {
+#[fully_pub]
+impl<S: Send + Sync> NLDriver<S> {
     /// Get a context to manipulate link objects
     /// Loans many references out.
-    pub fn link<'m>(
+    fn link<'m>(
         &'m mut self,
     ) -> (
         NLCtx<
@@ -304,24 +317,15 @@ impl NLStateful {
             BTreeMap<LinkKey, Existence<LinkDev>>,
             impl FnMut(&LinkKey, Option<&mut Existence<LinkDev>>) + 'm,
         >,
-        &mut NLWrapped,
+        &mut NLHandle<S>,
     ) {
         (
             new_link_ctx(&mut self.links, &self.link_kind, &mut self.veths),
             &mut self.conn,
         )
     }
-}
-
-impl NLStateful {
-    pub fn new(nl: &NLWrapped) -> Self {
-        Self {
-            conn: nl.clone(),
-            ..Default::default()
-        }
-    }
-    pub async fn fill(&mut self) -> Result<()> {
-        let netlink = self.conn.h();
+    async fn fill(&mut self) -> Result<()> {
+        let netlink = &self.conn;
         let mut links = netlink.rawh.link().get().execute();
         while let Some(link) = links.try_next().await? {
             use rtnetlink::netlink_packet_route::rtnl::link::nlas::Nla;
@@ -413,32 +417,33 @@ impl NLStateful {
     }
 
     // Some methods change state of self, which are therefore placed here
-    pub async fn remove_link<'at>(&'at mut self, k: &'at LinkKey) -> Result<LinkDev> {
+    async fn remove_link<'at>(&'at mut self, k: &'at LinkKey) -> Result<LinkDev> {
         // we want to reflect the state of links as that vector
         log::trace!("remove link {:?}", k);
         nl_ctx!(link, conn, self);
         // It needs link.index
-        let link_removed = link
-            .not_absent_then_set(k, Existence::ExpectAbsent)?
-            .exist()?;
-        conn.h().rm_link(link_removed.index).await?;
+        let link_removed = link.nset(k, Existence::ExpectAbsent)?.exist()?;
+        conn.rm_link(link_removed.index).await?;
         Ok(link_removed)
     }
     /// move link from this ns to dst
-    pub async fn move_link_to_ns(&mut self, k: &LinkKey, dst: &mut Self, fd: RawFd) -> Result<()> {
-        self.get_link(k.to_owned()).await?;
+    async fn move_link_to_ns<B: Send + Sync>(
+        &mut self,
+        k: &LinkKey,
+        dst: &mut NLDriver<B>,
+        pf: &PidOrFd,
+    ) -> Result<()> {
+        self.refresh_link(k.to_owned()).await?;
         nl_ctx!(link, conn, self);
 
-        let v = link
-            .not_absent_then_set(k, Existence::ExpectAbsent)?
-            .exist()?;
-        conn.h().ip_setns_by_fd(fd, v.index).await?;
+        let v = link.nset(k, Existence::ExpectAbsent)?.exist()?;
+        conn.ip_setns(pf, v.index).await?;
 
         nl_ctx!(link, _conn, dst);
         link.trans_to(k, LExistence::ShouldExist).await?;
         Ok(())
     }
-    pub async fn get_link(&mut self, name: LinkKey) -> Result<()> {
+    async fn refresh_link(&mut self, name: LinkKey) -> Result<()> {
         log::trace!("refresh {:?}", name);
         nl_ctx!(link, conn, self);
 
@@ -446,9 +451,9 @@ impl NLStateful {
             .trans_to(
                 &name,
                 LExistence::Exist(LazyVal::Todo(Box::pin(async {
-                    let k = conn.h().get_link(name.clone()).await?;
+                    let k = conn.get_link(name.clone()).await?;
                     let mut la: LinkDev = k.into();
-                    let addrs = conn.h().get_link_addrs(la.index).await?;
+                    let addrs = conn.get_link_addrs(la.index).await?;
                     la.fill_addrs(addrs)?;
                     Ok(la)
                 }))),
@@ -467,11 +472,11 @@ impl NLStateful {
 
         Ok(())
     }
-    pub async fn get_veth(&mut self, base: &VPairKey) -> Result<()> {
+    async fn get_veth(&mut self, base: &VPairKey) -> Result<()> {
         let lka = base.link(LinkAB::A);
         let lkb = base.link(LinkAB::B);
         for link_name in [lka, lkb] {
-            let result = self.get_link(link_name).await;
+            let result = self.refresh_link(link_name).await;
             if let Err(ref e) = result {
                 if let Some(_e) = e.downcast_ref::<MissingError>() {
                     // ignore
@@ -483,21 +488,21 @@ impl NLStateful {
         Ok(())
     }
     /// Errors if something already exists
-    pub async fn new_veth_pair(&mut self, name: VPairKey) -> Result<()> {
+    async fn new_veth_pair(&mut self, name: VPairKey) -> Result<()> {
         log::debug!("Create new veth pair, {:?}", name);
         if let Some(v) = self.veths.g(&name) {
             bail!("programming error: Veth already exists. {:?}", v);
         }
 
         nl_ctx!(link, conn, self);
-        conn.h().add_veth_pair(&name).await?;
+        conn.add_veth_pair(&name).await?;
         link.trans_to(&name.link(LinkAB::A), LExistence::ShouldExist)
             .await?;
         link.trans_to(&name.link(LinkAB::B), LExistence::ShouldExist)
             .await?;
         Ok(())
     }
-    pub async fn ip_add_route(
+    async fn ip_add_route(
         &mut self,
         index: u32,
         dst: Option<IpNetwork>,
@@ -507,10 +512,7 @@ impl NLStateful {
         self.routes
             .trans_to(&purpose, LExistence::ShouldExist)
             .await?;
-        self.conn.h().ip_add_route(index, dst, v4).await
-    }
-    pub fn id(&self) -> &NS {
-        &self.conn.h().id
+        self.conn.ip_add_route(index, dst, v4).await
     }
 }
 
@@ -580,14 +582,6 @@ impl DepedentEMapE<VPairKey, LinkAB, LinkKey, VethPair> for BTreeMap<VPairKey, V
 
 type VethPair = Map<LinkAB, Existence<LinkKey>>;
 
-impl NLWrapped {
-    pub fn new(value: impl Into<Arc<NLHandle>>) -> Self {
-        Self {
-            handle: Some(value.into()),
-        }
-    }
-}
-
 impl From<LinkMessage> for LinkDev {
     fn from(msg: LinkMessage) -> Self {
         let up = msg.header.flags & IFF_UP != 0;
@@ -600,17 +594,26 @@ impl From<LinkMessage> for LinkDev {
     }
 }
 
-impl NLHandle {
+impl NLHandle<PathBuf> {
     pub fn new_self_proc_tokio() -> Result<Self> {
         use rtnetlink::new_connection;
         let (connection, handle, _) = new_connection().unwrap();
         tokio::spawn(connection);
         Ok(Self {
             rawh: handle,
-            id: NS::from_path(SELF_NET.into())?,
+            id: ExactNS::from_pid(PidPath::Selfproc, "net")?,
         })
     }
-    pub async fn rm_link(&self, index: u32) -> Result<()> {
+}
+
+pub enum PidOrFd {
+    Pid(u32),
+    Fd(Box<dyn AsFd>),
+}
+
+#[fully_pub]
+impl<S: Send + Sync> NLHandle<S> {
+    async fn rm_link(&self, index: u32) -> Result<()> {
         self.rawh
             .link()
             .del(index)
@@ -618,7 +621,7 @@ impl NLHandle {
             .await
             .map_err(anyhow::Error::from)
     }
-    pub async fn get_link(&self, name: LinkKey) -> Result<LinkMessage> {
+    async fn get_link(&self, name: LinkKey) -> Result<LinkMessage> {
         let mut links = self.rawh.link().get().match_name(name.into()).execute();
         if let Some(link) = links.try_next().await? {
             Ok(link)
@@ -626,7 +629,7 @@ impl NLHandle {
             Err(MissingError.into())
         }
     }
-    pub async fn get_link_addrs(&self, index: u32) -> Result<Vec<AddressMessage>> {
+    async fn get_link_addrs(&self, index: u32) -> Result<Vec<AddressMessage>> {
         let addrs = self
             .rawh
             .address()
@@ -636,7 +639,7 @@ impl NLHandle {
         let addrs: Vec<AddressMessage> = addrs.try_collect().await?;
         Ok(addrs)
     }
-    pub async fn set_link_up(&self, index: u32) -> Result<()> {
+    async fn set_link_up(&self, index: u32) -> Result<()> {
         self.rawh
             .link()
             .set(index)
@@ -645,7 +648,7 @@ impl NLHandle {
             .await
             .map_err(anyhow::Error::from)
     }
-    pub async fn add_veth_pair(&self, base_name: &VPairKey) -> Result<()> {
+    async fn add_veth_pair(&self, base_name: &VPairKey) -> Result<()> {
         self.rawh
             .link()
             .add()
@@ -657,7 +660,7 @@ impl NLHandle {
             .await
             .map_err(|e| anyhow!("adding {base_name:?} veth pair fails. {e}"))
     }
-    pub async fn add_addr_dev(&self, addr: IpNetwork, dev: u32) -> Result<()> {
+    async fn add_addr_dev(&self, addr: IpNetwork, dev: u32) -> Result<()> {
         // assuming the desired IP has not been added
         self.rawh
             .address()
@@ -666,7 +669,7 @@ impl NLHandle {
             .await
             .map_err(anyhow::Error::from)
     }
-    pub async fn del_addr(&self, addr: AddressMessage) -> Result<()> {
+    async fn del_addr(&self, addr: AddressMessage) -> Result<()> {
         self.rawh
             .address()
             .del(addr)
@@ -674,18 +677,19 @@ impl NLHandle {
             .await
             .map_err(anyhow::Error::from)
     }
-    pub async fn ip_setns_by_fd(&self, fd: RawFd, dev: u32) -> Result<()> {
-        self.rawh
-            .link()
-            .set(dev)
-            .setns_by_fd(fd)
-            .execute()
-            .await
-            .map_err(anyhow::Error::from)
+    async fn ip_setns(&self, fd: &PidOrFd, dev: u32) -> Result<()> {
+        let p = self.rawh.link().set(dev);
+        match fd {
+            PidOrFd::Fd(f) => p.setns_by_fd(f.as_fd().as_raw_fd()),
+            PidOrFd::Pid(f) => p.setns_by_pid(*f),
+        }
+        .execute()
+        .await
+        .map_err(anyhow::Error::from)
     }
     // one of dst and v4 must be Some
     // XXX must have run once in exec paths
-    pub async fn ip_add_route(
+    async fn ip_add_route(
         &self,
         index: u32,
         dst: Option<IpNetwork>,
@@ -734,26 +738,28 @@ pub struct VethConn {
 
 impl VethConn {
     /// Adaptive application of Veth connection, accepting dirty state
-    pub async fn apply<'n>(
+    pub async fn apply<'n, A: Send + Sync, B: Send + Sync>(
         &self,
-        subject_ns: &'n mut NLStateful,
-        t_ns: &'n mut NLStateful,
-    ) -> Result<()> {
-        let t_ns_f = t_ns.id().open().await?;
-        if subject_ns.id() == t_ns.id() {
+        na: &'n mut NLDriver<A>,
+        nb: &'n mut NLDriver<B>,
+    ) -> Result<()>
+    where
+        NLHandle<B>: GetPidOrFd,
+    {
+        let fd = nb.conn.open()?;
+        if na.conn == nb.conn {
             bail!("Invalid VethConn, subject and target NS can not be the same");
         }
         let mut redo = false;
         let (mut a, mut b) = (false, false);
         let mut a_in_t = false;
-        if let Some(v) = subject_ns.veths.g(&self.key) {
+        if let Some(v) = na.veths.g(&self.key) {
             if v.lenient(&LinkAB::A) {
                 a = true;
                 if v.lenient(&LinkAB::B) {
-                    subject_ns
-                        .move_link_to_ns(&self.key.link(LinkAB::B), t_ns, t_ns_f.as_raw_fd())
+                    na.move_link_to_ns(&self.key.link(LinkAB::B), nb, &fd)
                         .await?;
-                    t_ns.get_link(self.key.link(LinkAB::B)).await?;
+                    nb.refresh_link(self.key.link(LinkAB::B)).await?;
                 }
             } else {
                 redo = true;
@@ -761,7 +767,7 @@ impl VethConn {
         } else {
             redo = true;
         }
-        if let Some(v) = t_ns.veths.g(&self.key) {
+        if let Some(v) = nb.veths.g(&self.key) {
             if v.lenient(&LinkAB::B) {
                 b = true;
                 if v.lenient(&LinkAB::A) {
@@ -776,32 +782,31 @@ impl VethConn {
         }
         if redo {
             if a {
-                subject_ns.remove_link(&self.key.link(LinkAB::A)).await?;
+                na.remove_link(&self.key.link(LinkAB::A)).await?;
             }
             if a_in_t {
-                t_ns.remove_link(&self.key.link(LinkAB::A)).await?;
+                nb.remove_link(&self.key.link(LinkAB::A)).await?;
             }
             if b {
-                t_ns.remove_link(&self.key.link(LinkAB::B)).await?;
+                nb.remove_link(&self.key.link(LinkAB::B)).await?;
             }
-            subject_ns.new_veth_pair(self.key.clone()).await?;
-            subject_ns
-                .move_link_to_ns(&self.key.link(LinkAB::B), t_ns, t_ns_f.as_raw_fd())
+            na.new_veth_pair(self.key.clone()).await?;
+            na.move_link_to_ns(&self.key.link(LinkAB::B), nb, &fd)
                 .await?;
         }
         Ok(())
     }
-    pub async fn apply_addr_up<'n>(
+    pub async fn apply_addr_up<'n, A: Send + Sync, B: Send + Sync>(
         &self,
-        subject_ns: &'n mut NLStateful,
-        t_ns: &'n mut NLStateful,
+        na: &'n mut NLDriver<A>,
+        nb: &'n mut NLDriver<B>,
     ) -> Result<()> {
-        subject_ns.get_link(self.key.link(LinkAB::A)).await?;
-        nl_ctx!(link, conn, subject_ns);
+        na.refresh_link(self.key.link(LinkAB::A)).await?;
+        nl_ctx!(link, conn, na);
         let la = link.not_absent(&self.key.link(LinkAB::A))?.exist_mut()?;
         conn.set_up(la).await?;
         conn.ensure_addrs_46(la, self.ip_va, self.ip6_va).await?;
-        nl_ctx!(link, conn, t_ns);
+        nl_ctx!(link, conn, nb);
         let lk = self.key.link(LinkAB::B);
         let la = link.not_absent(&lk)?.exist_mut()?;
         conn.set_up(la).await?;

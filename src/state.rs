@@ -18,7 +18,6 @@ use std::{
 use fixed_map::{Key, Map};
 use std::collections::HashMap;
 
-use crate::netlink::NLWrapped;
 use crate::*;
 
 // Runtime checking of correct execution
@@ -279,7 +278,7 @@ pub trait ExistenceMap<K: Debug + Clone> {
         }
     }
     /// Assuming the object is perceived, change it, and returns the original state
-    fn not_absent_then_set(&mut self, key: &K, expect: Self::V) -> Result<Self::V> {
+    fn nset(&mut self, key: &K, expect: Self::V) -> Result<Self::V> {
         let p = self.set(key, expect);
         match p {
             Some(x) => Ok(x),

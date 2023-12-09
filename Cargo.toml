@@ -21,3 +21,7 @@ async-recursion = "1.0.4"
 log = "0.4.20"
 fixed-map = "0.9.2"
 thiserror = "1.0.48"
+fully_pub = "0.1.4"
+nsproxy-common = { path = "../common" }
+derive-new = "0.6.0"
+libc = "0.2.150"
