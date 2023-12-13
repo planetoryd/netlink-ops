@@ -7,7 +7,7 @@ use futures::{future::Ready, Future, FutureExt, SinkExt, StreamExt, TryFutureExt
 use ipnetwork::IpNetwork;
 
 use libc::pid_t;
-use nsproxy_common::{ExactNS, PidPath};
+use nsproxy_common::{ExactNS, NSSource, PidPath, NSFrom};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::AsyncWriteExt,
@@ -64,39 +64,23 @@ use futures::stream::TryStreamExt;
 use rtnetlink::netlink_packet_route::{rtnl::link::LinkMessage, AddressMessage, IFF_UP};
 use rtnetlink::{Handle, NetworkNamespace};
 
-#[derive(Clone, Debug, derive_new::new)]
+#[derive(Clone, Debug, derive_new::new, Derivative)]
+#[derivative(PartialEq, Eq)]
 /// Handle with relevant information
 /// Eq iff NS equals
-pub struct NLHandle<S: Send + Sync> {
+pub struct NLHandle {
+    #[derivative(PartialEq = "ignore")]
     rawh: Handle,
-    id: ExactNS<S>,
-}
-
-impl<S: Send + Sync> ::std::cmp::Eq for NLHandle<S> where S: ::std::cmp::Eq {}
-
-impl<S: Send + Sync, B: Send + Sync> ::std::cmp::PartialEq<NLHandle<B>> for NLHandle<S> {
-    fn eq(&self, other: &NLHandle<B>) -> bool {
-        true && match *self {
-            NLHandle {
-                rawh: _,
-                id: ref __self_1,
-            } => match *other {
-                NLHandle {
-                    rawh: _,
-                    id: ref __other_1,
-                } => true && &(*__self_1) == &(*__other_1),
-            },
-        }
-    }
+    id: ExactNS,
 }
 
 #[derive(Derivative, new)]
 #[derivative(PartialEq, Eq, Debug)]
 /// Netlink manipulator with locally duplicated state
-pub struct NLDriver<S: Send + Sync> {
+pub struct NLDriver {
     #[derivative(PartialEq = "ignore")]
     #[derivative(Debug = "ignore")]
-    pub conn: NLHandle<S>,
+    pub conn: NLHandle,
     #[new(default)]
     veths: BTreeMap<VPairKey, VethPair>,
     #[new(default)]
@@ -120,20 +104,17 @@ pub trait GetPidOrFd {
     fn open(&self) -> Result<PidOrFd>;
 }
 
-impl GetPidOrFd for NLHandle<pid_t> {
+impl GetPidOrFd for NLHandle {
     fn open(&self) -> Result<PidOrFd> {
-        Ok(PidOrFd::Pid(self.id.source.try_into()?))
-    }
-}
-
-impl GetPidOrFd for NLHandle<PathBuf> {
-    fn open(&self) -> Result<PidOrFd> {
-        Ok(PidOrFd::Fd(Box::new(std::fs::File::open(&self.id.source)?)))
+        Ok(match &self.id.source {
+            NSSource::Pid(p) => PidOrFd::Pid((*p).try_into()?),
+            NSSource::Path(p) => PidOrFd::Fd(Box::new(std::fs::File::open(&p)?)),
+        })
     }
 }
 
 #[fully_pub]
-impl<S: Send + Sync> NLHandle<S> {
+impl NLHandle {
     async fn set_up(&self, link: &mut LinkDev) -> Result<()> {
         if link.up.get() == Some(&true) {
             Ok(())
@@ -305,7 +286,7 @@ fn new_link_ctx<'m>(
 }
 
 #[fully_pub]
-impl<S: Send + Sync> NLDriver<S> {
+impl NLDriver {
     /// Get a context to manipulate link objects
     /// Loans many references out.
     fn link<'m>(
@@ -317,7 +298,7 @@ impl<S: Send + Sync> NLDriver<S> {
             BTreeMap<LinkKey, Existence<LinkDev>>,
             impl FnMut(&LinkKey, Option<&mut Existence<LinkDev>>) + 'm,
         >,
-        &mut NLHandle<S>,
+        &mut NLHandle,
     ) {
         (
             new_link_ctx(&mut self.links, &self.link_kind, &mut self.veths),
@@ -427,10 +408,10 @@ impl<S: Send + Sync> NLDriver<S> {
         Ok(link_removed)
     }
     /// move link from this ns to dst
-    async fn move_link_to_ns<B: Send + Sync>(
+    async fn move_link_to_ns(
         &mut self,
         k: &LinkKey,
-        dst: &mut NLDriver<B>,
+        dst: &mut NLDriver,
         pf: &PidOrFd,
     ) -> Result<()> {
         self.refresh_link(k.to_owned()).await?;
@@ -594,14 +575,14 @@ impl From<LinkMessage> for LinkDev {
     }
 }
 
-impl NLHandle<PathBuf> {
+impl NLHandle {
     pub fn new_self_proc_tokio() -> Result<Self> {
         use rtnetlink::new_connection;
         let (connection, handle, _) = new_connection().unwrap();
         tokio::spawn(connection);
         Ok(Self {
             rawh: handle,
-            id: ExactNS::from_pid(PidPath::Selfproc, "net")?,
+            id: ExactNS::from_source((PidPath::Selfproc, "net"))?,
         })
     }
 }
@@ -612,7 +593,7 @@ pub enum PidOrFd {
 }
 
 #[fully_pub]
-impl<S: Send + Sync> NLHandle<S> {
+impl NLHandle {
     async fn rm_link(&self, index: u32) -> Result<()> {
         self.rawh
             .link()
@@ -738,13 +719,9 @@ pub struct VethConn {
 
 impl VethConn {
     /// Adaptive application of Veth connection, accepting dirty state
-    pub async fn apply<'n, A: Send + Sync, B: Send + Sync>(
-        &self,
-        na: &'n mut NLDriver<A>,
-        nb: &'n mut NLDriver<B>,
-    ) -> Result<()>
+    pub async fn apply<'n>(&self, na: &'n mut NLDriver, nb: &'n mut NLDriver) -> Result<()>
     where
-        NLHandle<B>: GetPidOrFd,
+        NLHandle: GetPidOrFd,
     {
         let fd = nb.conn.open()?;
         if na.conn == nb.conn {
@@ -796,10 +773,10 @@ impl VethConn {
         }
         Ok(())
     }
-    pub async fn apply_addr_up<'n, A: Send + Sync, B: Send + Sync>(
+    pub async fn apply_addr_up<'n>(
         &self,
-        na: &'n mut NLDriver<A>,
-        nb: &'n mut NLDriver<B>,
+        na: &'n mut NLDriver,
+        nb: &'n mut NLDriver,
     ) -> Result<()> {
         na.refresh_link(self.key.link(LinkAB::A)).await?;
         nl_ctx!(link, conn, na);
