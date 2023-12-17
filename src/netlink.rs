@@ -109,6 +109,7 @@ impl GetPidOrFd for NLHandle {
         Ok(match &self.id.source {
             NSSource::Pid(p) => PidOrFd::Pid((*p).try_into()?),
             NSSource::Path(p) => PidOrFd::Fd(Box::new(std::fs::File::open(&p)?)),
+            NSSource::Unavail => unreachable!()
         })
     }
 }
