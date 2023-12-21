@@ -7,7 +7,7 @@ use futures::{future::Ready, Future, FutureExt, SinkExt, StreamExt, TryFutureExt
 use ipnetwork::IpNetwork;
 
 use libc::pid_t;
-use nsproxy_common::{ExactNS, NSSource, PidPath, NSFrom};
+use nsproxy_common::{ExactNS, NSFrom, NSSource, PidPath};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::AsyncWriteExt,
@@ -70,8 +70,8 @@ use rtnetlink::{Handle, NetworkNamespace};
 /// Eq iff NS equals
 pub struct NLHandle {
     #[derivative(PartialEq = "ignore")]
-    rawh: Handle,
-    id: ExactNS,
+    pub rawh: Handle,
+    pub id: ExactNS,
 }
 
 #[derive(Derivative, new)]
@@ -88,8 +88,6 @@ pub struct NLDriver {
     links_index: BTreeMap<u32, LinkKey>,
     #[new(default)]
     links: BTreeMap<LinkKey, Existence<LinkDev>>,
-    #[new(default)]
-    link_kind: HashMap<u32, nlas::InfoKind>,
     #[new(default)]
     routes: HashMap<RouteFor, Existence<()>>,
 }
@@ -109,7 +107,7 @@ impl GetPidOrFd for NLHandle {
         Ok(match &self.id.source {
             NSSource::Pid(p) => PidOrFd::Pid((*p).try_into()?),
             NSSource::Path(p) => PidOrFd::Fd(Box::new(std::fs::File::open(&p)?)),
-            NSSource::Unavail => unreachable!()
+            NSSource::Unavail => unreachable!(),
         })
     }
 }
@@ -250,7 +248,6 @@ impl Trans for LinkKey {
 
 fn new_link_ctx<'m>(
     links: &'m mut BTreeMap<LinkKey, Existence<LinkDev>>,
-    link_kind: &'m HashMap<u32, InfoKind>,
     veths: &'m mut BTreeMap<VPairKey, VethPair>,
 ) -> NLCtx<
     'm,
@@ -265,7 +262,7 @@ fn new_link_ctx<'m>(
                 if let Some(v) = v {
                     match v {
                         Existence::Exist(att) => {
-                            let pass = if let Some(k) = link_kind.get(&att.index) {
+                            let pass = if let Some(k) = &att.kind {
                                 matches!(k, InfoKind::Veth)
                             } else {
                                 true
@@ -302,7 +299,7 @@ impl NLDriver {
         &mut NLHandle,
     ) {
         (
-            new_link_ctx(&mut self.links, &self.link_kind, &mut self.veths),
+            new_link_ctx(&mut self.links, &mut self.veths),
             &mut self.conn,
         )
     }
@@ -310,47 +307,12 @@ impl NLDriver {
         let netlink = &self.conn;
         let mut links = netlink.rawh.link().get().execute();
         while let Some(link) = links.try_next().await? {
-            use rtnetlink::netlink_packet_route::rtnl::link::nlas::Nla;
-
-            let mut name = None;
-            let up = link.header.flags & IFF_UP != 0;
-            let index = link.header.index;
-
-            for n in link.nlas {
-                match n {
-                    Nla::IfName(n) => name = Some(n),
-                    Nla::OperState(s) => match s {
-                        _ => (),
-                    },
-                    Nla::Info(k) => {
-                        for i in k {
-                            match i {
-                                nlas::Info::Kind(x) => {
-                                    self.link_kind.insert(index, x);
-                                }
-                                _ => (),
-                            }
-                        }
-                    }
-                    _ => (),
-                }
-            }
-            let name = name.ok_or(DevianceError)?;
-            let mut li = LinkDev {
-                up: Exp::Confirmed(up),
-                index,
-                addrs: Default::default(),
-                pair: None,
-            };
+            let mut li: LinkDev = link.try_into()?;
             li.addrs.to_filled()?;
-            let Self {
-                links,
-                link_kind,
-                veths,
-                ..
-            } = self;
-            let mut link = new_link_ctx(links, link_kind, veths);
-            let lk: LinkKey = name.parse()?;
+            let Self { links, veths, .. } = self;
+            let mut link = new_link_ctx(links, veths);
+            let lk: LinkKey = li.name.as_ref().ok_or(DevianceError)?.parse()?;
+            let index = li.index;
             link.fill(&lk, Existence::Exist(li))?;
             let k = self.links_index.insert(index, lk);
             assert!(k.is_none());
@@ -422,7 +384,7 @@ impl NLDriver {
         conn.ip_setns(pf, v.index).await?;
 
         nl_ctx!(link, _conn, dst);
-        link.trans_to(k, LExistence::ShouldExist).await?;
+        let _ = link.trans_to(k, LExistence::ShouldExist).await;
         Ok(())
     }
     async fn refresh_link(&mut self, name: LinkKey) -> Result<()> {
@@ -434,7 +396,7 @@ impl NLDriver {
                 &name,
                 LExistence::Exist(LazyVal::Todo(Box::pin(async {
                     let k = conn.get_link(name.clone()).await?;
-                    let mut la: LinkDev = k.into();
+                    let mut la: LinkDev = k.try_into()?;
                     let addrs = conn.get_link_addrs(la.index).await?;
                     la.fill_addrs(addrs)?;
                     Ok(la)
@@ -510,6 +472,13 @@ pub struct LinkDev {
     pub addrs: ExpCollection<HashMap<IpNetwork, Existence<AddressMessage>>>,
     /// associated veth pair if any
     pub pair: Option<VPairKey>,
+    pub max_mtu: Option<u32>,
+    #[derivative(Hash = "ignore")]
+    #[derivative(PartialEq = "ignore")]
+    #[derivative(PartialOrd = "ignore")]
+    #[derivative(Ord = "ignore")]
+    pub kind: Option<nlas::InfoKind>,
+    pub name: Option<String>,
 }
 
 impl LinkDev {
@@ -564,15 +533,48 @@ impl DepedentEMapE<VPairKey, LinkAB, LinkKey, VethPair> for BTreeMap<VPairKey, V
 
 type VethPair = Map<LinkAB, Existence<LinkKey>>;
 
-impl From<LinkMessage> for LinkDev {
-    fn from(msg: LinkMessage) -> Self {
-        let up = msg.header.flags & IFF_UP != 0;
-        LinkDev {
-            up: Exp::Confirmed(up),
-            addrs: Default::default(),
-            index: msg.header.index.into(),
-            pair: None,
+impl TryFrom<LinkMessage> for LinkDev {
+    type Error = anyhow::Error;
+    fn try_from(link: LinkMessage) -> Result<Self> {
+        use rtnetlink::netlink_packet_route::rtnl::link::nlas::Nla;
+        let mut name = None;
+        let up = link.header.flags & IFF_UP != 0;
+        let index = link.header.index;
+        let mut max_mtu = None;
+        let mut link_kind = None;
+        for n in link.nlas {
+            match n {
+                Nla::IfName(n) => name = Some(n),
+                Nla::OperState(s) => match s {
+                    _ => (),
+                },
+                Nla::Info(k) => {
+                    for i in k {
+                        match i {
+                            nlas::Info::Kind(x) => {
+                                link_kind = Some(x);
+                            }
+                            _ => (),
+                        }
+                    }
+                }
+                Nla::MaxMtu(max) => {
+                    max_mtu = Some(max);
+                }
+                _ => (),
+            }
         }
+        let mut li = LinkDev {
+            up: Exp::Confirmed(up),
+            index,
+            addrs: Default::default(),
+            pair: None,
+            max_mtu,
+            kind: link_kind,
+            name,
+        };
+
+        Ok(li)
     }
 }
 
