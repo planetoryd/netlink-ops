@@ -23,7 +23,7 @@ use std::{
     any::{Any, TypeId},
     collections::{BTreeMap, BTreeSet, HashSet},
     default,
-    fmt::Debug,
+    fmt::{Debug, Display, Pointer},
     hash::Hash,
     net::Ipv6Addr,
     ops::{Deref, Index},
@@ -192,6 +192,12 @@ impl From<LinkKey> for String {
 /// Use .parse()
 #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, Debug, PartialOrd, Ord)]
 pub struct VPairKey(String);
+
+impl Display for VPairKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 impl FromStr for VPairKey {
     type Err = anyhow::Error;
