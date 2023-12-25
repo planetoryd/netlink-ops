@@ -82,14 +82,14 @@ pub struct NLDriver {
     #[derivative(Debug = "ignore")]
     pub conn: NLHandle,
     #[new(default)]
-    veths: BTreeMap<VPairKey, VethPair>,
+    pub veths: BTreeMap<VPairKey, VethPair>,
     #[new(default)]
     /// msg.header.index
-    links_index: BTreeMap<u32, LinkKey>,
+    pub links_index: BTreeMap<u32, LinkKey>,
     #[new(default)]
-    links: BTreeMap<LinkKey, Existence<LinkDev>>,
+    pub links: BTreeMap<LinkKey, Existence<LinkDev>>,
     #[new(default)]
-    routes: HashMap<RouteFor, Existence<()>>,
+    pub routes: HashMap<RouteFor, Existence<()>>,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
