@@ -104,7 +104,13 @@ pub trait GetPidOrFd {
 
 impl GetPidOrFd for NLHandle {
     fn open(&self) -> Result<PidOrFd> {
-        Ok(match &self.id.source {
+        self.id.open()
+    }
+}
+
+impl GetPidOrFd for ExactNS {
+    fn open(&self) -> Result<PidOrFd> {
+        Ok(match &self.source {
             NSSource::Pid(p) => PidOrFd::Pid((*p).try_into()?),
             NSSource::Path(p) => PidOrFd::Fd(Box::new(std::fs::File::open(&p)?)),
             NSSource::Unavail(_) => unreachable!(),
@@ -171,7 +177,7 @@ impl NLHandle {
 
 /// Use .parse()
 #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, Debug, PartialOrd, Ord)]
-pub struct LinkKey(String);
+pub struct LinkKey(pub String);
 
 impl FromStr for LinkKey {
     type Err = anyhow::Error;
@@ -605,7 +611,7 @@ impl NLHandle {
 
 pub enum PidOrFd {
     Pid(u32),
-    Fd(Box<dyn AsFd>),
+    Fd(Box<dyn AsFd + Send + Sync>),
 }
 
 #[fully_pub]
