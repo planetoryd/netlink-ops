@@ -130,11 +130,17 @@ impl NLHandle {
         }
     }
     async fn add_addr(&mut self, link: &mut LinkDev, ip: IpNetwork) -> Result<()> {
-        if let Result::Ok(k) = link.addrs.filled()?.not_absent(&ip)
-            && (matches!(k, Existence::Exist(_)) || matches!(k, Existence::ShouldExist))
-        {
-            // we don't error here.
+        let should_add = if let Result::Ok(k) = link.addrs.filled()?.not_absent(&ip) {
+            if (matches!(k, Existence::Exist(_)) || matches!(k, Existence::ShouldExist)) {
+                // we don't error here.
+                false
+            } else {
+                true
+            }
         } else {
+            true
+        };
+        if should_add {
             link.addrs
                 .filled()?
                 .trans_to(&ip, LExistence::ShouldExist)
